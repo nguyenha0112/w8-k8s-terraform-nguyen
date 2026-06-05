@@ -1,25 +1,25 @@
 # K8s on AWS - Terraform 1-Click
 
-Deploy a lightweight landing page into a Minikube Kubernetes cluster running
-on one AWS EC2 instance, then expose the application to the Internet through an
+Repo này dùng Terraform để dựng một EC2 trên AWS, cài Minikube trong EC2,
+deploy một landing page nginx vào Kubernetes, rồi expose app ra Internet qua
 AWS Application Load Balancer (ALB).
 
-The complete infrastructure and application deployment are automated by
-Terraform. The application is not installed directly on EC2.
+App **không được cài trực tiếp trên EC2**. App chạy trong Kubernetes Pods của
+Minikube cluster.
 
-## Challenge Requirements
+## Yêu Cầu Và Cách Đáp Ứng
 
-| Requirement | Implementation |
+| Yêu cầu | Cách làm trong repo |
 | --- | --- |
-| Infrastructure created by Terraform | VPC, subnets, routing, security groups, EC2, IAM, ALB, listener, and target group |
-| Kubernetes runs on EC2 | Minikube with the Docker driver |
-| App runs inside Kubernetes | nginx Deployment with two Pods, ConfigMap landing page, and NodePort Service |
-| App is accessible through an ALB | ALB forwards HTTP traffic to an EC2 host proxy, then to the Minikube NodePort |
-| One-click deployment | `terraform init; terraform apply -auto-approve` |
-| At least two Terraform providers | `hashicorp/aws` and `hashicorp/cloudinit` |
-| Clean removal | `terraform destroy -auto-approve` |
+| Hạ tầng dựng bằng Terraform | Terraform tạo VPC, subnet, route table, security group, EC2, IAM, ALB, listener, target group |
+| Kubernetes chạy bằng Minikube hoặc kind trên EC2 | Dùng Minikube với Docker driver trên EC2 |
+| App chạy trong Kubernetes | nginx Deployment 2 Pods, ConfigMap landing page, NodePort Service |
+| App truy cập được qua ALB | ALB forward HTTP vào EC2 port `8080`, sau đó proxy vào Minikube NodePort `30080` |
+| 1-click automation | `terraform init; terraform apply -auto-approve` |
+| Có >=2 Terraform provider | `hashicorp/aws` và `hashicorp/cloudinit` |
+| Destroy sạch sau khi xong | `terraform destroy -auto-approve` |
 
-## Architecture
+## Sơ Đồ Kiến Trúc
 
 ```text
 Internet
@@ -28,77 +28,105 @@ Internet
 AWS Application Load Balancer :80
    |
    v
-ALB Target Group
+Target Group
 Target: EC2 instance :8080
    |
    v
-systemd-managed socat proxy
-EC2 :8080 -> Minikube IP :30080
+systemd socat proxy trên EC2
    |
    v
-Kubernetes NodePort Service :30080
+Minikube IP :30080
+   |
+   v
+Kubernetes NodePort Service
    |
    v
 nginx Deployment, 2 Pods
    |
    v
-ConfigMap-based landing page
+ConfigMap landing page
 ```
 
-AWS infrastructure:
+Hạ tầng AWS:
 
 ```text
 VPC 10.42.0.0/16
-├── Public subnet 10.42.0.0/24, Availability Zone A
-│   └── EC2 instance running Docker and Minikube
-├── Public subnet 10.42.1.0/24, Availability Zone B
-├── Internet Gateway and public route table
-└── Internet-facing ALB spanning both public subnets
+├── Public subnet 10.42.0.0/24, AZ A
+│   └── EC2 chạy Docker + Minikube
+├── Public subnet 10.42.1.0/24, AZ B
+├── Internet Gateway + public route table
+└── Internet-facing ALB nằm trên 2 public subnet
 ```
 
-## Traffic Flow
+## Luồng Traffic
 
-1. A browser sends an HTTP request to the ALB DNS name on port `80`.
-2. The ALB forwards the request to the registered EC2 instance on port `8080`.
-3. A systemd-managed `socat` process forwards EC2 port `8080` to the Minikube
-   node IP on Kubernetes NodePort `30080`.
-4. The Kubernetes Service selects one of the nginx Pods.
-5. nginx serves the landing page mounted from a Kubernetes ConfigMap.
+Khi mở URL ALB trên browser:
 
-The EC2 security group allows port `8080` only from the ALB security group.
-SSH and the Kubernetes NodePort are not exposed to the Internet.
+```text
+Browser
+  -> ALB :80
+  -> EC2 :8080
+  -> socat proxy
+  -> Minikube NodePort :30080
+  -> Kubernetes Service hello-app
+  -> nginx Pod
+  -> HTML landing page
+```
 
-## Why This Design
+Giải thích port:
 
-### Minikube
+| Port | Ý nghĩa |
+| --- | --- |
+| `80` trên ALB | HTTP public cho browser |
+| `8080` trên EC2 | Port host để ALB target vào |
+| `30080` trên Minikube | Kubernetes NodePort |
+| `80` trong Pod | Port nginx container |
 
-Minikube is used because the challenge requires Minikube or kind on one EC2
-instance. The Docker driver keeps the cluster lightweight and avoids installing
-Kubernetes components directly on the host.
+EC2 security group chỉ cho ALB security group truy cập port `8080`.
+Không mở SSH `22`, không mở NodePort `30080` ra Internet.
 
-### NodePort and Host Proxy
+## Vì Sao Chọn Thiết Kế Này?
 
-The Minikube Docker node uses an internal Docker network address that the ALB
-cannot target directly. A fixed NodePort gives the application a stable port
-inside Minikube, while the host proxy gives the ALB a stable EC2 port.
+### Vì sao dùng Minikube?
 
-This keeps the application inside Kubernetes while allowing a normal ALB
-instance target group to reach it.
+Đề bài yêu cầu chạy Kubernetes bằng Minikube hoặc kind trên EC2. Minikube phù
+hợp với mô hình single-node Kubernetes và dễ bootstrap bằng script trong EC2.
 
-### Custom VPC
+### Vì sao dùng Docker driver?
 
-The project creates its own VPC instead of relying on the account's default
-VPC. This makes the deployment reproducible across clean AWS accounts and gives
-the ALB the required subnets in two Availability Zones.
+Minikube dùng Docker driver để tạo Kubernetes node bên trong Docker trên EC2:
 
-### Systems Manager
+```text
+EC2 Ubuntu
+  -> Docker
+      -> Minikube node
+          -> Kubernetes Pods
+```
 
-The EC2 instance receives an IAM instance profile for AWS Systems Manager.
-This allows troubleshooting without opening SSH port `22`.
+### Vì sao cần NodePort và proxy?
 
-## Terraform Provider Wiring
+App chạy trong Kubernetes nên cần expose Service ra ngoài cluster. Repo dùng
+NodePort `30080`.
 
-This project uses two providers in the same Terraform configuration:
+Vì Minikube Docker driver chạy node trong Docker network nội bộ, ALB không gọi
+trực tiếp Pod hoặc Docker internal network. Vì vậy EC2 mở port `8080` cho ALB,
+rồi `socat` proxy từ EC2 `8080` vào Minikube NodePort `30080`.
+
+### Vì sao dùng SSM thay vì SSH?
+
+Nếu dùng SSH thì cần key pair và mở port `22`. Repo này dùng AWS Systems
+Manager để debug EC2:
+
+```text
+EC2 có IAM role AmazonSSMManagedInstanceCore
+EC2 có SSM Agent
+Không cần key pair
+Không cần mở port 22
+```
+
+## Terraform Providers Và Provider Wiring
+
+Repo dùng 2 provider:
 
 ```hcl
 provider "aws" {
@@ -108,19 +136,45 @@ provider "aws" {
 provider "cloudinit" {}
 ```
 
-The `cloudinit` provider renders the EC2 bootstrap script as MIME cloud-init
-user data:
+### `aws` provider
+
+Dùng để tạo tài nguyên AWS:
+
+```text
+VPC, subnet, route table, security group
+IAM role, instance profile
+EC2
+ALB, listener, target group
+```
+
+### `cloudinit` provider
+
+Dùng để render và đóng gói bootstrap script thành `user_data_base64`.
+
+File bootstrap:
+
+```text
+templates/bootstrap.sh.tftpl
+```
+
+Đoạn render:
 
 ```hcl
 data "cloudinit_config" "minikube" {
+  gzip          = true
+  base64_encode = true
+
   part {
     content_type = "text/x-shellscript"
-    content      = templatefile("${path.module}/templates/bootstrap.sh.tftpl", ...)
+    content = templatefile("${path.module}/templates/bootstrap.sh.tftpl", {
+      minikube_version = var.minikube_version
+      kubectl_version  = var.kubectl_version
+    })
   }
 }
 ```
 
-The `aws` provider consumes the rendered result when creating EC2:
+Đoạn wire sang AWS EC2:
 
 ```hcl
 resource "aws_instance" "minikube" {
@@ -128,43 +182,64 @@ resource "aws_instance" "minikube" {
 }
 ```
 
-Provider dependency:
+Luồng wiring:
 
 ```text
-templatefile
-   -> cloudinit_config.minikube.rendered
-   -> aws_instance.minikube.user_data_base64
-   -> EC2 bootstraps Minikube and deploys the Kubernetes app
+bootstrap.sh.tftpl
+  -> cloudinit provider render/gzip/base64
+  -> data.cloudinit_config.minikube.rendered
+  -> aws_instance.minikube.user_data_base64
+  -> EC2 boot
+  -> cloud-init trong Ubuntu chạy script
 ```
 
-The Terraform Kubernetes provider is intentionally not used. The Minikube
-cluster and its kubeconfig exist only after EC2 boots, and the kubeconfig stays
-inside EC2. Deploying the manifest through cloud-init allows the infrastructure
-and application to be created in one Terraform apply without exposing the
-Kubernetes API or requiring a second apply.
+Lưu ý: Ubuntu EC2 có sẵn `cloud-init` để chạy user-data khi boot. Terraform
+`cloudinit` provider là phần chạy ở phía Terraform để đóng gói user-data trước
+khi gửi vào EC2.
 
-## What EC2 Bootstrap Does
+## Bootstrap Script Làm Gì?
 
-The script in `templates/bootstrap.sh.tftpl` performs these steps:
+File `templates/bootstrap.sh.tftpl` là template user-data script. Khi EC2 boot
+lần đầu, cloud-init chạy script này.
 
-1. Installs Docker, `curl`, `socat`, Minikube, kubectl, and the SSM agent.
-2. Creates swap space so Minikube can run reliably on the Free Tier-compatible
-   `t3.small` instance.
-3. Starts Minikube with the Docker driver.
-4. Creates a Kubernetes ConfigMap containing the landing page HTML.
-5. Creates an nginx Deployment with two replicas.
-6. Creates a NodePort Service on port `30080`.
-7. Waits for the Deployment rollout to complete.
-8. Starts a systemd service that proxies EC2 port `8080` to the NodePort.
+Script thực hiện:
 
-## Prerequisites
+```text
+Cài Docker, curl, socat
+Tạo swap 2 GB
+Cài/bật SSM Agent
+Tải Minikube
+Tải kubectl
+Start Minikube bằng Docker driver
+Tạo Kubernetes ConfigMap chứa HTML landing page
+Tạo nginx Deployment 2 replicas
+Tạo NodePort Service port 30080
+Đợi rollout hoàn tất
+Tạo systemd service proxy EC2 8080 -> Minikube 30080
+```
+
+## Vì Sao Không Dùng Kubernetes Provider?
+
+Kubernetes provider cần cluster có sẵn trước khi Terraform chạy. Nhưng trong
+bài này, Minikube cluster chỉ tồn tại sau khi EC2 boot và chạy bootstrap script.
+Kubeconfig cũng nằm trong EC2.
+
+Vì vậy repo không dùng Kubernetes provider. EC2 tự chạy:
+
+```bash
+kubectl apply -f /root/app.yaml
+```
+
+Cách này giúp toàn bộ workflow chạy được trong một lần Terraform apply.
+
+## Yêu Cầu Trước Khi Chạy
 
 - Terraform `>= 1.5`
-- AWS CLI authenticated to an AWS account
-- AWS permissions for EC2, VPC, ELBv2, IAM, and Systems Manager
-- An AWS region with at least two Availability Zones
+- AWS CLI đã đăng nhập account AWS
+- IAM user/role có quyền tạo EC2, VPC, ELBv2, IAM, SSM
+- Region có ít nhất 2 Availability Zones
 
-Defaults:
+Giá trị mặc định:
 
 ```text
 AWS region:    ap-southeast-1
@@ -173,114 +248,139 @@ Minikube:      v1.37.0
 kubectl:       v1.34.1
 ```
 
-To override defaults, create `terraform.tfvars` based on
-`terraform.tfvars.example`.
+Nếu muốn override biến, copy:
 
-## 1-Click Deploy
+```text
+terraform.tfvars.example -> terraform.tfvars
+```
 
-From a clean repository, run:
+## Lệnh Deploy
+
+Từ repo sạch, chạy:
 
 ```powershell
 terraform init; terraform apply -auto-approve
 ```
 
-Terraform prints:
+Giải thích:
 
 ```text
-app_url     = "http://<alb-dns-name>"
-instance_id = "i-xxxxxxxxxxxxxxxxx"
+terraform init
+  -> tải provider
+
+terraform apply -auto-approve
+  -> tự động tạo hạ tầng, không hỏi nhập yes
 ```
 
-EC2 must download the Minikube base image and Kubernetes images during the
-first boot. The ALB URL can return `502 Bad Gateway` for several minutes until
-the cluster, Pods, proxy, and ALB health checks are ready.
-
-Get the URL again:
+Sau khi apply xong, lấy URL:
 
 ```powershell
 terraform output -raw app_url
 ```
 
-## Verification
+EC2 cần vài phút để tải Minikube image, start cluster và deploy app. Trong thời
+gian đó ALB có thể trả `502 Bad Gateway`. Đợi Target Group chuyển `Healthy` rồi
+mở lại URL.
 
-### Verify the Public URL
+## Verify
 
-Open the `app_url` output in a browser. The page should display:
+### 1. Kiểm tra browser
 
-```text
-K8s on AWS
-Terraform 1-Click deployment is running successfully.
-```
-
-This browser page is the required ALB evidence.
-
-### Verify the App Runs in Kubernetes
-
-Use AWS Systems Manager Run Command or Session Manager on the EC2 instance:
-
-```bash
-sudo minikube status
-sudo kubectl get nodes
-sudo kubectl get deployment,pods,service,configmap
-sudo kubectl describe service hello-app
-```
-
-Expected Kubernetes resources:
+Mở URL từ output:
 
 ```text
-deployment.apps/hello-app
-pod/hello-app-...
-service/hello-app
-configmap/hello-app-html
+http://<alb-dns-name>
 ```
 
-The nginx package is not installed as an application on EC2. nginx runs only
-inside the Kubernetes Pods.
-
-### Verify the ALB Target
-
-In the AWS console:
+Trang mong đợi:
 
 ```text
-EC2 -> Target Groups -> minikube-alb-tg -> Targets
+Xbrain Cloud & AI Operations
+Keep your systems running at their best.
 ```
 
-The EC2 target on port `8080` should be `Healthy`.
+### 2. Kiểm tra ALB target healthy
 
-## Troubleshooting
+```powershell
+$tgArn = aws elbv2 describe-target-groups `
+  --region ap-southeast-1 `
+  --names minikube-alb-tg `
+  --query TargetGroups[0].TargetGroupArn `
+  --output text
 
-The first bootstrap can take several minutes. Use Systems Manager to inspect:
-
-```bash
-sudo cloud-init status --long
-sudo tail -n 200 /var/log/cloud-init-output.log
-sudo minikube status
-sudo kubectl get pods,service
-sudo systemctl status minikube-app-proxy
+aws elbv2 describe-target-health `
+  --region ap-southeast-1 `
+  --target-group-arn $tgArn `
+  --query TargetHealthDescriptions[].TargetHealth `
+  --output json
 ```
 
-Common observations:
+Kết quả mong đợi:
 
-- `502 Bad Gateway`: the ALB target is not healthy yet.
-- Target is unhealthy: Minikube, Pods, or the proxy may still be starting.
-- cloud-init is running: wait for Minikube image downloads to complete.
-- cloud-init is in error: inspect `/var/log/cloud-init-output.log`.
+```json
+[
+  {
+    "State": "healthy"
+  }
+]
+```
+
+### 3. Kiểm tra app chạy trong Kubernetes
+
+Chạy qua AWS SSM:
+
+```powershell
+$instanceId = terraform output -raw instance_id
+
+$cmdId = aws ssm send-command `
+  --region ap-southeast-1 `
+  --instance-ids $instanceId `
+  --document-name AWS-RunShellScript `
+  --parameters commands="HOME=/root kubectl get all" `
+  --query Command.CommandId `
+  --output text
+
+Start-Sleep -Seconds 5
+
+aws ssm get-command-invocation `
+  --region ap-southeast-1 `
+  --command-id $cmdId `
+  --instance-id $instanceId `
+  --query StandardOutputContent `
+  --output text
+```
+
+Kết quả mong đợi:
+
+```text
+pod/hello-app-...          1/1 Running
+pod/hello-app-...          1/1 Running
+service/hello-app          NodePort 80:30080
+deployment.apps/hello-app  2/2
+```
 
 ## Destroy
 
-Destroy all resources after collecting evidence:
+Sau khi chụp evidence, chạy:
 
 ```powershell
 terraform destroy -auto-approve
 ```
 
-This removes EC2, ALB, IAM resources, networking resources, and the Terraform
-managed infrastructure. EC2 and ALB can incur charges while they exist.
+Kiểm tra state:
 
-## Project Structure
+```powershell
+terraform state list
+```
+
+Nếu không có output, Terraform không còn quản lý resource nào.
+
+## Cấu Trúc Repo
 
 ```text
 .
+├── README.md
+├── EVIDENCE_PACK.vi.md
 ├── main.tf
 ├── outputs.tf
 ├── variables.tf
@@ -288,5 +388,39 @@ managed infrastructure. EC2 and ALB can incur charges while they exist.
 ├── terraform.tfvars.example
 ├── templates/
 │   └── bootstrap.sh.tftpl
-└── README.md
+├── .terraform.lock.hcl
+└── .gitignore
+```
+
+Ý nghĩa:
+
+| File | Tác dụng |
+| --- | --- |
+| `versions.tf` | Khai báo Terraform version và providers |
+| `variables.tf` | Khai báo biến đầu vào |
+| `main.tf` | Tạo hạ tầng AWS và wire cloudinit vào EC2 |
+| `outputs.tf` | In `app_url` và `instance_id` |
+| `templates/bootstrap.sh.tftpl` | User-data script để EC2 tự cài Minikube và deploy app |
+| `terraform.tfvars.example` | File mẫu override biến |
+| `.terraform.lock.hcl` | Lock provider version |
+| `EVIDENCE_PACK.vi.md` | Bằng chứng chạy bài |
+| `.gitignore` | Không push state/cache/local notes |
+
+## Không Push State
+
+Repo không push:
+
+```text
+.terraform/
+terraform.tfstate
+terraform.tfstate.backup
+terraform.tfvars
+```
+
+Lý do:
+
+```text
+.terraform/ là cache provider local, chạy terraform init sẽ tự tạo lại.
+terraform.tfstate chứa thông tin resource/account AWS, không nên public.
+terraform.tfvars là cấu hình local của từng người.
 ```
