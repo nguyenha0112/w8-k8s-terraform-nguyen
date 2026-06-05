@@ -5,5 +5,4 @@
 crash.log
 terraform.tfvars
 PRESENTATION_NOTES*.md
-EVIDENCE_PACK*.md
 evidence/
